@@ -4,8 +4,13 @@
     "height": 1080,
     "fit": "pad"
   },
+  "monitor": {
+    "port": 8080
+  },
   "audio": {
     "device": 0,
+    "device_name": "USB",
+    "stale_seconds": 2.0,
     "samplerate": 44100,
     "block_seconds": 0.05,
     "auto_threshold": true,

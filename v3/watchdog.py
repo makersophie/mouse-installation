@@ -35,6 +35,7 @@ BUTTON = None
 HERE = os.path.dirname(os.path.abspath(__file__))
 TARGET = os.path.join(HERE, "mouse_video.py")
 LOGFILE = os.path.expanduser("~/mouse.log")
+EVENTS_FILE = os.path.expanduser("~/mouse_events.log")   # shown by the monitor
 
 BUTTON_PIN = 17
 STALE_SECONDS = 15.0      # log older than this = wedged
@@ -53,8 +54,19 @@ def launch():
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def note(msg):
+    """Add a line to the event log the monitor page shows, so a restart at 3am
+    is still visible in the morning."""
+    try:
+        with open(EVENTS_FILE, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "  watchdog: " + msg + "\n")
+    except OSError:
+        pass
+
+
 def restart(reason):
     print(f"[{time.strftime('%H:%M:%S')}] restarting — {reason}", flush=True)
+    note(f"restarting — {reason}")
     subprocess.run(["pkill", "-f", "mouse_video.py"])
     subprocess.run(["pkill", "mpv"])
     time.sleep(2)
@@ -68,6 +80,7 @@ def restart(reason):
 
 def reboot():
     print("hold detected — rebooting", flush=True)
+    note("button held — rebooting the Pi")
     subprocess.run(["sudo", "reboot"])
 
 

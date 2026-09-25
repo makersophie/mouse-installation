@@ -265,12 +265,74 @@ the loop in the wrong place.
 
 ---
 
+## 15. Mouse stays out, looping, and ignores every sound
+
+**Symptom.** After running a while the mouse sits in its loop forever. Claps do
+nothing. The program is running, `~/mouse.log` keeps updating and says
+`mic=ok` — but `vol=` never changes. The watchdog doesn't restart anything,
+because the log looks fresh.
+
+**Cause.** The USB mic's stream stopped delivering (a USB hiccup, a brown-out, a
+knock to the cable). sounddevice simply stops calling the callback; nothing
+raises an error. The last level and status stay frozen at their last values, so
+everything *looked* healthy while `is_loud()` could never be True again. And a
+mic that failed to open at boot was never retried.
+
+**Fix.** `Mic` now has a supervisor thread. If no sample has arrived for
+`audio.stale_seconds` (2s), or the stream has stopped or errored, it closes the
+stream, restarts PortAudio (so a replugged mic is found again), and reopens —
+trying `audio.device` first, then any input whose name contains
+`audio.device_name` (`"USB"`), since the number shifts between boots (#3).
+`~/mouse.log` shows `mic_age=` — seconds since the last sample — and
+`mic=stalled: …` while it is recovering. Every loss and recovery goes in the
+event log.
+
+---
+
+## 16. Screen frozen on one frame, program still running
+
+**Symptom.** Same picture as #5/#10: the log changes state, the screen doesn't.
+
+**Fix.** The main loop watches mpv's playback position. Every clip either loops
+or is left within seconds, so a position that hasn't moved for 12s means mpv has
+stopped responding; the program kills it and the existing check relaunches it
+into the empty scene. Also fixed: a relaunched mpv used to leave the previous
+socket reader running, and two readers on one socket drop messages. And state
+`OUT` now gives up after 5s if mpv never reports a position for the clip.
+
+---
+
+## The monitor page
+
+With the installation running, open **http://raspberrypi.local:8080** from a
+laptop or phone on the same Wi-Fi. It shows:
+
+- **Microphone** — "last sample … ms ago" is the heartbeat. If it climbs past
+  2s the mic is dead (#15), whatever the status says.
+- **Sound level** — the live level against the threshold and the room's noise
+  floor, with ▲ where a sound was detected and the state changes marked. Clap:
+  the bar should cross the red line.
+- **State / quiet timer / video** — where the state machine is and whether mpv's
+  position is moving (#16).
+- **Event log** — history from `~/mouse_events.log`, which survives restarts and
+  includes the watchdog's restarts and button presses. **copy** puts it on the
+  clipboard to paste into an issue or a chat.
+- A one-line **diagnosis** at the top, in plain words.
+
+The page is read-only. It cannot listen for itself: a USB mic can be held by one
+program at a time. For the same reason, stop the installation before running
+`mic_check.py`. Change the port with `"monitor": {"port": 8080}` in
+`scenes.json`; `0` turns the page off.
+
+---
+
 ## Quick diagnosis checklist
 
 ```bash
 pgrep -f mouse_video.py        # is the program running?
 pgrep -f mpv | wc -l           # exactly one mpv should be running
 cat ~/mouse.log                # vol / thr / state / character / quiet — read it twice
+tail -30 ~/mouse_events.log    # what happened, and when — or open the monitor page
 ls build/*.mp4 | wc -l         # clips built? if 0, run: python3 build_scenes.py
 python3 build_scenes.py --check  # validate scenes.json without encoding
 ls -l /tmp/mpvsocket           # mpv control socket should exist
@@ -279,6 +341,8 @@ ls -l /tmp/mpvsocket           # mpv control socket should exist
 - Program running, log updates, but screen frozen → **#5 (use OpenGL)**, or
   **#10** if it had been running for hours.
 - `mic=error` in the log → **#3 (wrong DEVICE index)**.
+- Mouse out, looping, deaf; `mic_age=` keeps growing → **#15** (should now
+  recover by itself within a few seconds; if not, reseat the USB mic).
 - `quiet` never climbs, mouse hidden → **#4 / #12 (threshold vs. the room)**.
 - Mouse appears without playing its emerge → **#9**.
 - A clap is sometimes ignored → **#11**.

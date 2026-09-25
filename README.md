@@ -68,6 +68,11 @@ python3 build_scenes.py     # photos -> clips
 python3 mouse_video.py      # run
 ```
 
+While it runs, **http://raspberrypi.local:8080** (from any laptop or phone on the
+same network) shows a live monitor: what the mic hears against the threshold,
+the current state, and an event log. See
+[TROUBLESHOOTING.md](v3/TROUBLESHOOTING.md#the-monitor-page).
+
 `watchdog.py` adds a hardware reset button on GPIO 17 and restarts the program
 automatically if it stops responding. Register it in `~/.config/labwc/autostart`
 to bring everything up on boot.
