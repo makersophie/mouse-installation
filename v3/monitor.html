@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mouse Monitor</title>
+<!--
+  Served by mouse_video.py at http://raspberrypi.local:8080
+  Read-only: it shows what the installation hears and does, and changes nothing.
+-->
+<style>
+  :root {
+    --bg: #f6f5f2; --card: #ffffff; --ink: #1c1b19; --muted: #6e6a63; --line: #e4e1db;
+    --ok: #1f8a4c; --ok-bg: #e5f4ea; --warn: #a86500; --warn-bg: #fdf1dc;
+    --bad: #c0362c; --bad-bg: #fbe6e3; --level: #2f6fd6; --thr: #c0362c; --floor: #8f8a82;
+    --trig: #e08a00; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141413; --card: #1e1d1b; --ink: #ecebe7; --muted: #9b968d; --line: #33312d;
+      --ok: #4cc27f; --ok-bg: #16301f; --warn: #f0b04a; --warn-bg: #33270f;
+      --bad: #f06a5f; --bad-bg: #3a1916; --level: #6ea1ff; --thr: #f06a5f; --floor: #8a857c;
+      --trig: #f0b04a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1180px; margin: 0 auto; padding: 16px; display: grid; gap: 14px; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 18px; margin: 0; font-weight: 650; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px;
+    border-radius: 99px; font-size: 12px; font-weight: 600; background: var(--line); }
+  .pill.ok { background: var(--ok-bg); color: var(--ok); }
+  .pill.bad { background: var(--bad-bg); color: var(--bad); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .spacer { flex: 1; }
+  .sub { color: var(--muted); font-size: 12px; }
+
+  #diag { padding: 12px 14px; border-radius: 10px; font-weight: 550; border: 1px solid transparent; }
+  #diag.ok { background: var(--ok-bg); color: var(--ok); }
+  #diag.warn { background: var(--warn-bg); color: var(--warn); }
+  #diag.bad { background: var(--bad-bg); color: var(--bad); }
+  #diag small { display: block; font-weight: 400; color: var(--ink); opacity: .8; margin-top: 3px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; min-width: 0; }
+  .card h2 { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+    margin: 0 0 8px; font-weight: 650; display: flex; align-items: center; gap: 8px; }
+  .big { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 12px; margin-top: 6px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+  .ok-t { color: var(--ok); } .warn-t { color: var(--warn); } .bad-t { color: var(--bad); }
+  .beat { width: 10px; height: 10px; border-radius: 50%; background: var(--line); transition: background .15s; }
+  .beat.on { background: var(--ok); }
+  .bar { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; margin-top: 8px; }
+  .bar > i { display: block; height: 100%; background: var(--level); width: 0; transition: width .2s; }
+
+  .meter { position: relative; height: 26px; background: var(--line); border-radius: 6px; overflow: hidden; margin: 10px 0 4px; }
+  .meter > i { position: absolute; inset: 0 auto 0 0; background: var(--level); width: 0; transition: width .08s; }
+  .meter > b { position: absolute; top: -2px; bottom: -2px; width: 3px; background: var(--thr); }
+  .meter.hit > i { background: var(--trig); }
+  .meter-row { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+    font-size: 12px; font-family: var(--mono); color: var(--muted); }
+  canvas { width: 100%; height: 220px; display: block; margin-top: 8px; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .legend span::before { content: ""; display: inline-block; width: 14px; height: 3px; margin-right: 6px;
+    vertical-align: middle; background: var(--c); }
+
+  .two { display: grid; grid-template-columns: 3fr 2fr; gap: 12px; }
+  .log { font-family: var(--mono); font-size: 12px; max-height: 420px; overflow: auto; margin: 0;
+    border-top: 1px solid var(--line); }
+  .log div { display: grid; grid-template-columns: 76px 1fr; gap: 8px; padding: 3px 2px;
+    border-bottom: 1px solid var(--line); }
+  .log time { color: var(--muted); }
+  .log .bad { color: var(--bad); } .log .warn { color: var(--warn); } .log .good { color: var(--ok); }
+  .log .state { color: var(--ink); } .log .dim { color: var(--muted); }
+  pre.raw { font-family: var(--mono); font-size: 12px; background: var(--bg); border-radius: 8px;
+    padding: 10px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; min-height: 64px; }
+  .tools { display: flex; gap: 8px; align-items: center; margin-left: auto; font-size: 12px; color: var(--muted); }
+  .tools input { accent-color: var(--level); }
+  button { font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--card); color: var(--ink); cursor: pointer; }
+
+  @media (max-width: 900px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } .two { grid-template-columns: 1fr; } }
+  @media (max-width: 460px) { .tiles { grid-template-columns: 1fr; } .big { font-size: 20px; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Mouse monitor</h1>
+    <span id="conn" class="pill"><span class="dot"></span><span>connecting…</span></span>
+    <span class="spacer"></span>
+    <span class="sub" id="meta"></span>
+  </header>
+
+  <div id="diag" class="warn">Waiting for the installation…</div>
+
+  <section class="tiles">
+    <div class="card">
+      <h2>Microphone <span class="beat" id="beat" title="flashes on every new sample"></span></h2>
+      <div class="big" id="micState">—</div>
+      <dl class="kv">
+        <dt>last sample</dt><dd id="micAge">—</dd>
+        <dt>samples/s</dt><dd id="micRate">—</dd>
+        <dt>device</dt><dd id="micDev">—</dd>
+        <dt>reopens</dt><dd id="micReopens">—</dd>
+        <dt>overflows</dt><dd id="micOver">—</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <h2>State</h2>
+      <div class="big" id="state">—</div>
+      <dl class="kv">
+        <dt>in state</dt><dd id="inState">—</dd>
+        <dt>character</dt><dd id="character">—</dd>
+        <dt>dog in</dt><dd id="eggs">—</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <h2>Quiet timer</h2>
+      <div class="big" id="quiet">—</div>
+      <div class="bar"><i id="quietBar"></i></div>
+      <dl class="kv">
+        <dt>last sound</dt><dd id="lastTrig">—</dd>
+        <dt>triggers</dt><dd id="trigCount">0 this session</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <h2>Video (mpv)</h2>
+      <div class="big" id="mpvState">—</div>
+      <dl class="kv">
+        <dt>playing</dt><dd id="mpvPath">—</dd>
+        <dt>position</dt><dd id="mpvPos">—</dd>
+        <dt>restarts</dt><dd id="mpvRestarts">—</dd>
+      </dl>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Sound level — what the installation hears</h2>
+    <div class="meter" id="meter"><i id="meterFill"></i><b id="meterThr"></b></div>
+    <div class="meter-row">
+      <span id="lvlNow">level —</span>
+      <span id="lvlThr">threshold —</span>
+      <span id="lvlFloor">floor —</span>
+      <span id="lvlPeak">loudest (30s) —</span>
+    </div>
+    <canvas id="graph"></canvas>
+    <div class="legend">
+      <span style="--c: var(--level)">level (speech band)</span>
+      <span style="--c: var(--thr)">threshold — cross it to scare the mouse</span>
+      <span style="--c: var(--floor)">room noise floor</span>
+      <span style="--c: var(--trig)">▲ sound detected</span>
+    </div>
+  </section>
+
+  <section class="two">
+    <div class="card">
+      <h2>Event log
+        <span class="tools">
+          <label><input type="checkbox" id="hideStates"> hide state changes</label>
+          <button id="copyLog">copy</button>
+        </span>
+      </h2>
+      <div class="log" id="events"></div>
+    </div>
+    <div class="card">
+      <h2>~/mouse.log (live)</h2>
+      <pre class="raw" id="mouseLog">—</pre>
+      <h2 style="margin-top:14px">Sound settings</h2>
+      <dl class="kv" id="settings"></dl>
+      <p class="sub" style="margin:10px 0 0">Tip: clap near the mic and check the bar crosses the red line and
+        an orange mark appears. If the level never moves at all, the mic is not being read.</p>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const WINDOW = 30;                      // seconds of graph
+const S = {
+  since: 0, ev: 0, started: null, samples: [], thr: [], triggers: [], events: [],
+  last: null, offline: 0, lastOkAt: 0, rate: [], trigTotal: 0,
+  pos: null, posChanged: 0, prevSamples: null,
+};
+
+const fmt = (v, d = 4) => (typeof v === 'number' && isFinite(v)) ? v.toFixed(d) : '—';
+const dur = s => s == null ? '—' : (s = Math.max(0, s)) < 60 ? `${s.toFixed(0)}s` : s < 3600 ? `${Math.floor(s / 60)}m ${Math.floor(s % 60)}s` : `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
+const clock = t => { const d = new Date(t * 1000); return d.toLocaleTimeString([], { hour12: false }); };
+
+async function poll() {
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 2500);
+    const r = await fetch(`/status?since=${S.since}&ev=${S.ev}`, { cache: 'no-store', signal: ctl.signal });
+    clearTimeout(timer);
+    if (!r.ok) throw new Error(r.status);
+    ingest(await r.json());
+    S.offline = 0; S.lastOkAt = Date.now();
+  } catch (e) {
+    S.offline++;
+  }
+  render();
+  setTimeout(poll, 300);
+}
+
+function ingest(d) {
+  if (S.started !== null && d.started !== S.started) {
+    // the program restarted: event ids start over, and it reloads the
+    // history from ~/mouse_events.log itself, so start the list afresh
+    S.events = []; S.ev = 0; S.since = 0; renderedEv = '';
+  }
+  S.started = d.started;
+  const now = d.now;
+  for (const [t, v] of d.samples) if (t > S.since) S.samples.push([t, v]);
+  if (d.samples.length) S.since = d.samples[d.samples.length - 1][0];
+  for (const t of d.triggers) if (!S.triggers.includes(t)) { S.triggers.push(t); S.trigTotal++; }
+  S.thr.push([now, d.mic.threshold, d.mic.floor]);
+  const cut = now - WINDOW - 2;
+  S.samples = S.samples.filter(s => s[0] > cut);
+  S.thr = S.thr.filter(s => s[0] > cut);
+  S.triggers = S.triggers.filter(t => t > now - 600);
+
+  const known = new Set(S.events.map(e => e.id));
+  for (const e of d.events) if (!known.has(e.id)) S.events.push(e);
+  if (d.events.length) S.ev = d.events[d.events.length - 1].id;
+  if (S.events.length > 400) S.events = S.events.slice(-400);
+
+  // sample rate over the last few polls
+  S.rate.push([Date.now(), d.mic.samples]);
+  S.rate = S.rate.filter(x => x[0] > Date.now() - 3000);
+
+  // is the video position moving?
+  const p = d.mpv.pos;
+  if (p !== S.pos) { S.pos = p; S.posChanged = Date.now(); }
+
+  S.beat = S.prevSamples !== null && d.mic.samples !== S.prevSamples;
+  S.prevSamples = d.mic.samples;
+  S.last = d;
+}
+
+function diagnose() {
+  const d = S.last;
+  if (S.offline >= 4 || !d) {
+    const ago = S.lastOkAt ? ` (last contact ${dur((Date.now() - S.lastOkAt) / 1000)} ago)` : '';
+    return ['bad', `Can't reach the installation${ago}.`,
+      'Either mouse_video.py is not running — the watchdog restarts it within ~25s, or press the button — or the Pi is off the network.'];
+  }
+  const m = d.mic, st = d.state, now = d.now;
+  const age = m.last_sample ? now - m.last_sample : null;
+  if (m.status.startsWith('error'))
+    return ['bad', 'The microphone cannot be opened.', `${m.status}. Check the USB cable. The program keeps retrying on its own.`];
+  if (age === null || age > 2)
+    return ['bad', `The microphone has gone silent — no samples for ${age === null ? 'ever' : dur(age)}.`,
+      'This is the "mouse loops forever and ignores sound" failure. The program is reopening the mic; if it stays red, reseat the USB mic.'];
+  if (!d.mpv.alive)
+    return ['bad', 'The video player (mpv) is not running.', 'The program relaunches it automatically.'];
+  if ((Date.now() - S.posChanged) / 1000 > 5 && !d.mpv.paused)
+    return ['bad', `The video is frozen — position hasn't moved for ${dur((Date.now() - S.posChanged) / 1000)}.`,
+      'mpv has stopped responding. The program kills and relaunches it after 12s.'];
+  if (d.mpv.path && d.mpv.requested && d.mpv.path !== d.mpv.requested)
+    return ['warn', 'mpv is playing a different file than the program asked for.',
+      `asked for ${d.mpv.requested}, playing ${d.mpv.path}. If this lasts, mpv is ignoring commands.`];
+  const lastTrig = S.triggers.length ? S.triggers[S.triggers.length - 1] : 0;
+  if (st.state === 'LOOP' && lastTrig > st.state_entered + 1.0 && now - lastTrig > 1.0)
+    return ['bad', 'A sound was detected but the mouse did not react.', 'The mic is fine; the problem is in the state machine or mpv. Check the event log.'];
+  if (st.state === 'LOOP' && st.in_state > 60) {
+    const peak = Math.max(0, ...S.samples.map(s => s[1]));
+    const ratio = m.threshold ? peak / m.threshold : 0;
+    if (ratio < 0.8)
+      return ['warn', `Mouse has been out for ${dur(st.in_state)}; the mic works but nothing has been loud enough.`,
+        `Loudest in the last 30s reached ${(ratio * 100).toFixed(0)}% of the threshold. Clap near the mic to test. If a clap doesn't cross the red line, lower audio.noise_margin in scenes.json.`];
+  }
+  if (m.floor && m.threshold > m.floor * 2.9 && m.threshold > 0.05)
+    return ['warn', 'The room is loud, so the threshold has risen.', 'Auto-threshold follows the room; quiet sounds will be ignored until it settles.'];
+  return ['ok', 'Listening normally.', `Mic delivering ${rate().toFixed(0)} samples/s · ${st.state || '—'} for ${dur(st.in_state)}`];
+}
+
+function rate() {
+  if (S.rate.length < 2) return 0;
+  const [a, b] = [S.rate[0], S.rate[S.rate.length - 1]];
+  return (b[1] - a[1]) / Math.max(0.001, (b[0] - a[0]) / 1000);
+}
+
+function render() {
+  const conn = $('conn');
+  const live = S.offline < 4 && S.last;
+  conn.className = 'pill ' + (live ? 'ok' : 'bad');
+  conn.lastChild.textContent = live ? 'live' : 'offline';
+
+  const [cls, head, detail] = diagnose();
+  const dg = $('diag'); dg.className = cls;
+  dg.textContent = head;
+  const sm = document.createElement('small'); sm.textContent = detail; dg.appendChild(sm);
+
+  const d = S.last; if (!d) return;
+  const m = d.mic, st = d.state, now = d.now;
+  $('meta').textContent = `pid ${d.pid} · up ${dur(now - d.started)} · Pi clock ${clock(now)}`;
+
+  // microphone
+  const age = m.last_sample ? now - m.last_sample : null;
+  const micOk = m.status === 'ok' && age !== null && age < 2;
+  $('micState').textContent = micOk ? 'listening'
+    : m.status.startsWith('error') ? 'error'
+    : age === null || age >= 2 ? 'no signal' : m.status.split(':')[0];
+  $('micState').className = 'big ' + (micOk ? 'ok-t' : 'bad-t');
+  $('micAge').textContent = age === null ? 'never' : `${(age * 1000).toFixed(0)} ms ago`;
+  $('micAge').className = age !== null && age < 1 ? '' : 'bad-t';
+  $('micRate').textContent = rate().toFixed(1);
+  $('micDev').textContent = `${m.device ?? '—'}${m.active ? '' : ' (inactive)'}`;
+  $('micReopens').textContent = m.reopens;
+  $('micOver').textContent = m.overflows;
+  $('beat').classList.toggle('on', !!S.beat);
+
+  // state
+  $('state').textContent = st.state || '—';
+  $('inState').textContent = dur(st.in_state);
+  $('character').textContent = st.character || '—';
+  $('eggs').textContent = st.eggs_in != null ? `${st.eggs_in} mice` : '—';
+
+  // quiet timer
+  $('quiet').textContent = `${dur(st.quiet_for)} / ${dur(st.needs_quiet)}`;
+  $('quietBar').style.width = `${Math.min(100, 100 * (st.quiet_for || 0) / (st.needs_quiet || 1))}%`;
+  const lt = S.triggers.length ? S.triggers[S.triggers.length - 1] : null;
+  $('lastTrig').textContent = lt ? `${dur(now - lt)} ago (${clock(lt)})` : 'none yet';
+  $('trigCount').textContent = `${S.trigTotal} while this page was open`;
+
+  // mpv
+  const frozen = (Date.now() - S.posChanged) / 1000 > 5 && !d.mpv.paused;
+  $('mpvState').textContent = !d.mpv.alive ? 'not running' : frozen ? 'frozen' : d.mpv.paused ? 'paused' : 'playing';
+  $('mpvState').className = 'big ' + (!d.mpv.alive || frozen ? 'bad-t' : 'ok-t');
+  $('mpvPath').textContent = d.mpv.path || '(loading)';
+  $('mpvPos').textContent = d.mpv.pos != null ? `${d.mpv.pos.toFixed(2)} / ${fmt(d.mpv.duration, 2)} s` : '—';
+  $('mpvRestarts').textContent = d.mpv.restarts;
+
+  // meter
+  const recent = S.samples.filter(s => s[0] > now - WINDOW);
+  const peak = Math.max(0, ...recent.map(s => s[1]));
+  const scale = Math.max((m.threshold || 0.02) * 2.5, peak * 1.1, 0.005);
+  $('meterFill').style.width = `${Math.min(100, 100 * m.level / scale)}%`;
+  $('meterThr').style.left = `${Math.min(99.5, 100 * (m.threshold || 0) / scale)}%`;
+  $('meter').classList.toggle('hit', !!st.loud);
+  $('lvlNow').textContent = `level ${fmt(m.level)}` + (m.floor ? ` (×${(m.level / m.floor).toFixed(1)} floor)` : '');
+  $('lvlThr').textContent = `threshold ${fmt(m.threshold)}`;
+  $('lvlFloor').textContent = `floor ${m.floor == null ? 'learning…' : fmt(m.floor)}`;
+  $('lvlPeak').textContent = `loudest (30s) ${fmt(peak)}`;
+
+  drawGraph(now, scale);
+  renderEvents();
+  $('mouseLog').textContent = d.mouse_log || '(empty)';
+  renderSettings(m);
+}
+
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+function drawGraph(now, scale) {
+  const c = $('graph'), dpr = window.devicePixelRatio || 1;
+  const W = c.clientWidth, H = c.clientHeight;
+  if (c.width !== W * dpr || c.height !== H * dpr) { c.width = W * dpr; c.height = H * dpr; }
+  const g = c.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  const padB = 18, plotH = H - padB;
+  const x = t => W - (now - t) / WINDOW * W;
+  const y = v => plotH - Math.min(1, v / scale) * (plotH - 4);
+
+  // grid: 5s ticks
+  g.strokeStyle = css('--line'); g.fillStyle = css('--muted'); g.lineWidth = 1;
+  g.font = '11px system-ui'; g.textAlign = 'center';
+  for (let s = 0; s <= WINDOW; s += 5) {
+    const xx = W - s / WINDOW * W;
+    g.beginPath(); g.moveTo(xx, 0); g.lineTo(xx, plotH); g.stroke();
+    if (s > 0 && s < WINDOW) g.fillText(`-${s}s`, xx, H - 4);
+  }
+
+  // state changes, from the event log; labels alternate rows and skip
+  // any that would collide, since a mouse cycle packs several into a second
+  g.textAlign = 'left';
+  const rowEnd = [-1e9, -1e9];            // right edge of the last label per row
+  for (const e of S.events) {
+    if (e.t < now - WINDOW || !e.msg.includes('→')) continue;
+    const xx = x(e.t);
+    g.strokeStyle = css('--line'); g.setLineDash([2, 3]);
+    g.beginPath(); g.moveTo(xx, 0); g.lineTo(xx, plotH); g.stroke(); g.setLineDash([]);
+    const label = e.msg.split('  (')[0].split('→ ')[1] || '';
+    const row = rowEnd.findIndex(end => xx > end + 4);
+    if (row < 0) continue;
+    g.fillStyle = css('--muted');
+    g.fillText(label, xx + 3, 12 + row * 13);
+    rowEnd[row] = xx + 3 + g.measureText(label).width;
+  }
+
+  // level
+  const pts = S.samples.filter(s => s[0] > now - WINDOW);
+  if (pts.length) {
+    g.fillStyle = css('--level') + '33';
+    g.beginPath(); g.moveTo(x(pts[0][0]), plotH);
+    for (const [t, v] of pts) g.lineTo(x(t), y(v));
+    g.lineTo(x(pts[pts.length - 1][0]), plotH); g.closePath(); g.fill();
+    g.strokeStyle = css('--level'); g.lineWidth = 1.5;
+    g.beginPath();
+    pts.forEach(([t, v], i) => i ? g.lineTo(x(t), y(v)) : g.moveTo(x(t), y(v)));
+    g.stroke();
+  }
+
+  // triggers, on top of the level so they stay visible
+  g.fillStyle = css('--trig');
+  for (const t of S.triggers) {
+    if (t < now - WINDOW) continue;
+    const xx = x(t);
+    g.fillRect(xx - 1, plotH - 8, 3, 8);
+    g.beginPath(); g.moveTo(xx - 5, plotH + 1); g.lineTo(xx + 5, plotH + 1); g.lineTo(xx, plotH - 8); g.fill();
+  }
+
+  // threshold and floor (stepped, as sampled each poll)
+  const line = (idx, color, dash) => {
+    const p = S.thr.filter(s => s[0] > now - WINDOW - 1 && s[idx] != null);
+    if (!p.length) return;
+    g.strokeStyle = color; g.lineWidth = 1.5; g.setLineDash(dash);
+    g.beginPath();
+    p.forEach((s, i) => {
+      const xx = Math.max(0, x(s[0])), yy = y(s[idx]);
+      if (i === 0) { g.moveTo(xx, yy); return; }
+      g.lineTo(xx, y(p[i - 1][idx]));
+      g.lineTo(xx, yy);
+    });
+    g.lineTo(W, y(p[p.length - 1][idx]));
+    g.stroke(); g.setLineDash([]);
+  };
+  line(2, css('--floor'), [4, 4]);
+  line(1, css('--thr'), [6, 3]);
+}
+
+function classify(msg) {
+  if (/lost|error|fail|frozen|not running|could not|killing|exiting/i.test(msg)) return 'bad';
+  if (/watchdog|restart|reopen|relaunch|button/i.test(msg)) return 'warn';
+  if (/ok again|mic open|started|monitor on/i.test(msg)) return 'good';
+  if (msg.includes('→')) return 'state';
+  return 'dim';
+}
+
+let renderedEv = '';
+function renderEvents() {
+  const hide = $('hideStates').checked;
+  const list = S.events.filter(e => !(hide && e.msg.includes('→')));
+  const key = `${hide}|${list.length}|${list.length ? list[list.length - 1].id : ''}`;
+  if (key === renderedEv) return;
+  renderedEv = key;
+  const box = $('events'); box.textContent = '';
+  const today = new Date().toDateString();
+  for (const e of list.slice().reverse()) {
+    const row = document.createElement('div');
+    const tm = document.createElement('time');
+    const dt = new Date(e.t * 1000);
+    tm.textContent = dt.toDateString() === today ? clock(e.t) : dt.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + clock(e.t).slice(0, 5);
+    const msg = document.createElement('span');
+    msg.textContent = e.msg;
+    msg.className = classify(e.msg);
+    row.append(tm, msg); box.appendChild(row);
+  }
+  if (!list.length) box.textContent = 'No events yet.';
+}
+
+function renderSettings(m) {
+  const rows = [
+    ['auto threshold', m.auto ? `on, ×${m.margin} floor` : 'off (fixed)'],
+    ['trigger needs', `${m.hits_needed} loud sample(s) in ${m.hit_window}s`],
+    ['band', m.band ? `${m.band[0]}–${m.band[1]} Hz` : 'full'],
+  ];
+  const box = $('settings'); box.textContent = '';
+  for (const [k, v] of rows) {
+    const dt = document.createElement('dt'); dt.textContent = k;
+    const dd = document.createElement('dd'); dd.textContent = v;
+    box.append(dt, dd);
+  }
+}
+
+$('hideStates').addEventListener('change', () => { renderedEv = ''; renderEvents(); });
+$('copyLog').addEventListener('click', () => {
+  const text = S.events.map(e => `${new Date(e.t * 1000).toLocaleString()}  ${e.msg}`).join('\n')
+    + '\n\n' + (S.last ? S.last.mouse_log : '');
+  navigator.clipboard?.writeText(text).then(() => { $('copyLog').textContent = 'copied'; setTimeout(() => $('copyLog').textContent = 'copy', 1200); });
+});
+window.addEventListener('resize', () => S.last && render());
+poll();
+</script>
+</body>
+</html>

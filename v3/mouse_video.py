@@ -41,6 +41,11 @@ Notes on the hard-won bits (see TROUBLESHOOTING.md):
   * mpv must use OpenGL, not its default Vulkan, or it displays nothing
   * mpv's IPC socket is drained by its own thread; letting replies and events
     pile up in that buffer eventually wedges mpv
+  * a mic that stops delivering is reopened by its own supervisor thread; a
+    dead stream used to leave the mouse looping forever, deaf (#15)
+
+Monitor: open http://raspberrypi.local:8080 from a laptop or phone on the same
+network to watch the level, the state machine and the event log live.
 """
 
 import collections
@@ -60,6 +65,53 @@ CONFIG = os.path.join(HERE, "scenes.json")
 BUILD = os.path.join(HERE, "build")
 LOGFILE = os.path.expanduser("~/mouse.log")
 MPV_SOCKET = "/tmp/mpvsocket"
+EVENTS_FILE = os.path.expanduser("~/mouse_events.log")
+EVENTS_MAX_BYTES = 512 * 1024
+
+
+# --- Event log ----------------------------------------------------------------
+# ~/mouse.log is overwritten twice a second with the current numbers. This is
+# the other half: an append-only history of what happened and when — state
+# changes, mic dropouts, mpv restarts — so a problem that happened overnight is
+# still there in the morning. watchdog.py writes to the same file.
+
+_events = collections.deque(maxlen=300)
+_events_lock = threading.Lock()
+_event_id = [0]
+
+
+def log_event(msg):
+    now = time.time()
+    with _events_lock:
+        _event_id[0] += 1
+        _events.append({"id": _event_id[0], "t": now, "msg": msg})
+        try:
+            if os.path.exists(EVENTS_FILE) and os.path.getsize(EVENTS_FILE) > EVENTS_MAX_BYTES:
+                os.replace(EVENTS_FILE, EVENTS_FILE + ".1")
+            with open(EVENTS_FILE, "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+                        + "  " + msg + "\n")
+        except OSError:
+            pass
+
+
+def load_past_events(n=150):
+    """Pick up the tail of the file, so the monitor shows what happened before
+    this run — including the watchdog's note of why it restarted us."""
+    try:
+        with open(EVENTS_FILE, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()[-n:]
+    except OSError:
+        return
+    with _events_lock:
+        for line in lines:
+            stamp, _, msg = line.rstrip("\n").partition("  ")
+            try:
+                t = time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S"))
+            except ValueError:
+                continue
+            _event_id[0] += 1
+            _events.append({"id": _event_id[0], "t": t, "msg": msg})
 
 
 # --- Microphone ---------------------------------------------------------------
@@ -67,11 +119,20 @@ MPV_SOCKET = "/tmp/mpvsocket"
 # version called sd.rec() in a loop, which opened and closed a stream for every
 # block and so went deaf in the gaps between them — short claps fell through it.
 # An InputStream is continuous, so nothing is missed.
+#
+# A stream can also simply stop: a USB hiccup, a brown-out, the mic unplugged
+# and replugged. The callback then just never runs again — level, status and
+# the log all freeze at their last values, looking healthy, while is_loud()
+# can never be True. A supervisor thread watches for that and reopens it.
 
 class Mic:
     def __init__(self, cfg):
         self.cfg = cfg
         self.device = cfg.get("device", 0)
+        # Fallback when the numbered device won't open: any input whose name
+        # contains this. The number shifts between boots (TROUBLESHOOTING #3).
+        self.device_name = cfg.get("device_name", "USB")
+        self.stale_seconds = float(cfg.get("stale_seconds", 2.0))
         self.samplerate = int(cfg.get("samplerate", 44100))
         self.block = int(float(cfg.get("block_seconds", 0.05)) * self.samplerate)
 
@@ -100,6 +161,14 @@ class Mic:
         self.floor_samples = collections.deque(maxlen=600)  # ~30s for the noise floor
         self._stream = None
 
+        # health, for the supervisor and the monitor
+        self.last_sample = 0.0
+        self.samples_total = 0
+        self.overflows = 0
+        self.reopens = 0
+        self.opened_at = 0.0
+        self.opened_device = None
+
     def _band_rms(self, x):
         """RMS of just the speech band, on the same scale as a plain RMS."""
         n = len(x)
@@ -127,26 +196,124 @@ class Mic:
             self.recent.append((now, rms))
             self.floor_samples.append(rms)
             self.status = "ok"
+            self.last_sample = now
+            self.samples_total += 1
+            if status:
+                self.overflows += 1
 
     def start(self):
+        self._open()
+        threading.Thread(target=self._supervise, daemon=True).start()
+
+    def _candidates(self):
+        out = [self.device]
+        if self.device_name:
+            try:
+                for i, d in enumerate(sd.query_devices()):
+                    if d["max_input_channels"] > 0 and i not in out and \
+                            str(self.device_name).lower() in d["name"].lower():
+                        out.append(i)
+            except Exception:
+                pass
+        return out
+
+    def _open(self):
+        err = None
+        for dev in self._candidates():
+            try:
+                s = sd.InputStream(
+                    device=dev, channels=1, samplerate=self.samplerate,
+                    blocksize=self.block, callback=self._callback)
+                s.start()
+            except Exception as e:
+                err = e
+                continue
+            self._stream = s
+            self.opened_device = dev
+            self.opened_at = time.time()
+            with self.lock:
+                self.status = "starting"
+            return True
+        with self.lock:
+            self.status = f"error: {err}"
+        return False
+
+    def _close(self):
+        s, self._stream = self._stream, None
+        if s is not None:
+            try:
+                s.abort()
+                s.close()
+            except Exception:
+                pass
+
+    def _reopen(self):
+        self._close()
         try:
-            self._stream = sd.InputStream(
-                device=self.device, channels=1, samplerate=self.samplerate,
-                blocksize=self.block, callback=self._callback)
-            self._stream.start()
-        except Exception as e:
-            self.status = f"error: {e}"
+            # PortAudio lists devices once, when it starts. A replugged mic is
+            # invisible until it is restarted.
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
+        return self._open()
+
+    def problem(self):
+        """Why the mic isn't delivering, or None if it is."""
+        with self.lock:
+            status, last = self.status, self.last_sample
+        if status.startswith("error"):
+            return status
+        try:
+            active = self._stream is not None and self._stream.active
+        except Exception:
+            active = False
+        if not active:
+            return "stream stopped"
+        silent = time.time() - max(last, self.opened_at)
+        if silent > self.stale_seconds:
+            return f"no samples for {silent:.0f}s"
+        return None
+
+    def _supervise(self):
+        """Runs on its own thread: reopening a stream can block, and blocking
+        the main loop blanks the screen (TROUBLESHOOTING #1)."""
+        delay, failing = 1.0, False
+        while True:
+            time.sleep(delay)
+            why = self.problem()
+            if why is None:
+                if failing and self.last_sample > self.opened_at:
+                    log_event(f"mic ok again (device {self.opened_device})")
+                    failing = False
+                delay = 1.0
+                continue
+            with self.lock:
+                if not self.status.startswith("error"):
+                    self.status = f"stalled: {why}"
+            if not failing:
+                log_event(f"mic lost: {why} — reopening")
+                failing = True
+            self.reopens += 1
+            # back off while it keeps failing (unplugged), so we don't hammer it
+            delay = 1.0 if self._reopen() else min(delay * 2, 10.0)
+
+    def floor(self):
+        """The room's resting level: the 20th percentile of the last ~30s."""
+        with self.lock:
+            samples = list(self.floor_samples)
+        if len(samples) < 40:
+            return None
+        return float(np.percentile(samples, 20))
 
     def threshold(self):
         """Where 'sound' begins. Auto mode tracks the room's own noise floor, so
         a kitchen with a fridge hum doesn't keep the mouse hidden forever."""
         if not self.auto:
             return self.fixed_threshold
-        with self.lock:
-            samples = list(self.floor_samples)
-        if len(samples) < 40:
+        floor = self.floor()
+        if floor is None:
             return self.fixed_threshold
-        floor = float(np.percentile(samples, 20))
         return max(self.min_threshold, floor * self.margin)
 
     def is_loud(self, threshold):
@@ -162,6 +329,21 @@ class Mic:
     def snapshot(self):
         with self.lock:
             return self.level, self.status
+
+    def health(self):
+        with self.lock:
+            h = {"status": self.status, "level": self.level, "raw": self.level_raw,
+                 "samples": self.samples_total, "overflows": self.overflows,
+                 "last_sample": self.last_sample}
+        try:
+            active = self._stream is not None and bool(self._stream.active)
+        except Exception:
+            active = False
+        h.update(threshold=self.threshold(), floor=self.floor(), active=active,
+                 device=self.opened_device, reopens=self.reopens, auto=self.auto,
+                 margin=self.margin, hits_needed=self.hits_needed,
+                 hit_window=self.hit_window, band=list(self.band) if self.band else None)
+        return h
 
 
 # --- mpv ----------------------------------------------------------------------
@@ -190,9 +372,21 @@ class Mpv:
         self.props = {}
         self.requested = None       # the file we last asked mpv to play
         self._stop = False
+        self._gen = 0               # bumped per launch; stale readers exit
+        self.restarts = 0
 
     # -- lifecycle --
     def start(self, first_file):
+        # A relaunch used to leave the previous reader thread running on the
+        # new socket, and two readers splitting one stream drop half the
+        # messages. Each reader now owns its socket and retires on relaunch.
+        self._gen += 1
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
         try:
             if os.path.exists(MPV_SOCKET):
                 os.remove(MPV_SOCKET)
@@ -231,7 +425,8 @@ class Mpv:
 
         self.requested = first_file
         self._stop = False
-        threading.Thread(target=self._reader, daemon=True).start()
+        threading.Thread(target=self._reader, args=(self.sock, self._gen),
+                         daemon=True).start()
         for i, name in enumerate(self.OBSERVED):
             self.command(["observe_property", i + 1, name])
         return True
@@ -249,11 +444,11 @@ class Mpv:
                 self.proc.terminate()
 
     # -- io --
-    def _reader(self):
+    def _reader(self, sock, gen):
         buf = b""
-        while not self._stop:
+        while not self._stop and gen == self._gen:
             try:
-                chunk = self.sock.recv(65536)
+                chunk = sock.recv(65536)
                 if not chunk:
                     time.sleep(0.1)
                     continue
@@ -348,6 +543,16 @@ class Mpv:
     def near_loop_end(self, margin=0.25):
         pos, dur = self.progress()
         return pos is not None and dur - pos <= margin
+
+    def info(self):
+        with self.lock:
+            p = dict(self.props)
+            req = self.requested
+        return {"alive": self.alive(), "restarts": self.restarts,
+                "requested": os.path.basename(req) if req else None,
+                "path": os.path.basename(p["path"]) if p.get("path") else None,
+                "pos": p.get("time-pos"), "duration": p.get("duration"),
+                "paused": p.get("pause")}
 
 
 # --- Scenes -------------------------------------------------------------------
@@ -444,6 +649,85 @@ def pick_character(characters, avoid=None):
 pending_seek = [None]
 
 
+# --- Monitor ------------------------------------------------------------------
+# A read-only page for watching the piece from a phone or laptop on the same
+# network:  http://raspberrypi.local:8080
+#
+# It shows what the installation itself hears. The page cannot listen for
+# itself: a USB mic can be held by only one program, so anything else opening
+# it would either fail or deafen the installation.
+
+STARTED = time.time()
+STATUS = [{}]                                   # the main loop's latest numbers
+TRIGGERS = collections.deque(maxlen=200)       # when is_loud() went True
+
+
+def monitor_status(mic, mpv, since, ev_after):
+    with mic.lock:
+        samples = [[round(t, 3), round(r, 6)] for t, r in mic.recent if t > since]
+    with _events_lock:
+        events = [e for e in _events if e["id"] > ev_after]
+    try:
+        with open(LOGFILE) as f:
+            mouse_log = f.read()
+    except OSError:
+        mouse_log = ""
+    return {"now": time.time(), "started": STARTED, "pid": os.getpid(),
+            "mic": mic.health(), "samples": samples,
+            "triggers": [t for t in TRIGGERS if t > since],
+            "state": STATUS[0], "mpv": mpv.info(),
+            "events": events, "mouse_log": mouse_log}
+
+
+def start_monitor(port, mic, mpv):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    page = os.path.join(HERE, "monitor.html")
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _send(self, code, body, ctype):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            url = urlparse(self.path)
+            if url.path in ("/", "/monitor.html"):
+                try:
+                    with open(page, "rb") as f:
+                        return self._send(200, f.read(), "text/html; charset=utf-8")
+                except OSError:
+                    return self._send(404, b"monitor.html is missing", "text/plain")
+            if url.path == "/status":
+                q = parse_qs(url.query)
+                try:
+                    since = float(q.get("since", ["0"])[0])
+                    ev = int(q.get("ev", ["0"])[0])
+                except ValueError:
+                    since, ev = 0.0, 0
+                body = json.dumps(monitor_status(mic, mpv, since, ev)).encode()
+                return self._send(200, body, "application/json")
+            self._send(404, b"not found", "text/plain")
+
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    except OSError as e:
+        log_event(f"monitor could not start on port {port}: {e}")
+        return None
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    host = socket.gethostname().removesuffix(".local")
+    log_event(f"monitor on http://{host}.local:{port}")
+    return srv
+
+
 # --- Main ---------------------------------------------------------------------
 
 def main():
@@ -484,12 +768,24 @@ def main():
             print("  - scenes.json defines no characters")
         raise SystemExit(1)
 
+    load_past_events()
+    log_event(f"program started (pid {os.getpid()})")
+
     mic = Mic(cfg.get("audio", {}))
     mic.start()
+    if mic.opened_device is not None:
+        log_event(f"mic open on device {mic.opened_device}")
+    else:
+        log_event(f"mic failed to open: {mic.status}")
 
     mpv = Mpv()
     if not mpv.start(base):
+        log_event("could not connect to mpv's IPC socket — exiting")
         raise SystemExit("Could not connect to mpv's IPC socket")
+
+    port = (cfg.get("monitor") or {}).get("port", 8080)
+    if port:
+        start_monitor(int(port), mic, mpv)
 
     character = pick_character(characters)
     current = None            # the clip currently on screen
@@ -497,6 +793,10 @@ def main():
     state_entered = time.time()
     next_quiet = character.quiet_seconds
     last_log = 0.0
+    was_loud = False
+    # mpv hang detection: the position we last saw and when it last moved
+    seen_pos, pos_moved = None, time.time()
+    MPV_FROZEN_SECONDS = 12.0
 
     # 0 - 5 - 0 : the loading sequence plays once, at startup.
     if loading:
@@ -505,21 +805,26 @@ def main():
     else:
         state = "BASE"
 
-    def enter(new_state):
+    def enter(new_state, why=""):
         nonlocal state, state_entered
+        if new_state != state:
+            log_event(f"{state} → {new_state}" + (f"  ({why})" if why else ""))
         state, state_entered = new_state, time.time()
 
-    def go_base():
+    def go_base(why=""):
         mpv.play(base, loop=True)
-        enter("COOLDOWN")
+        enter("COOLDOWN", why)
 
     try:
         while True:
             now = time.time()
 
             if not mpv.alive():
+                log_event("mpv not running — relaunching")
+                mpv.restarts += 1
                 mpv.start(base)
-                go_base()
+                seen_pos, pos_moved = None, time.time()
+                go_base("mpv relaunched")
                 continue
 
             if mpv.paused():
@@ -533,11 +838,14 @@ def main():
             if loud and state not in ("EASTER", "LOADING"):
                 last_sound = now
             quiet_for = now - last_sound
+            if loud and not was_loud:
+                TRIGGERS.append(now)
+            was_loud = loud
 
             # ----- 5 loading: 0 - 5 - 0 -----
             if state == "LOADING":
                 if mpv.finished() or now - state_entered > 60:
-                    go_base()
+                    go_base("loading done")
 
             # ----- 0 base: waiting for the room to settle -----
             elif state == "BASE":
@@ -545,11 +853,11 @@ def main():
                     if eggs.due():
                         name, path, speed = eggs.take()
                         mpv.play(path, loop=False, speed=speed)
-                        enter("EASTER")
+                        enter("EASTER", name)
                     else:
                         eggs.tick()
                         mpv.play(character.main, loop=False)
-                        enter("OUT")
+                        enter("OUT", f"quiet {quiet_for:.0f}s — {character.name}")
 
             # ----- 1 out: interruptible, and rewinds from where it got to -----
             elif state == "OUT":
@@ -561,16 +869,20 @@ def main():
                     mpv.play(character.rewind, loop=False, speed=character.rewind_speed)
                     if pos is not None:
                         pending_seek[0] = max(0.0, character.out_end - pos)
-                    enter("REWIND")
+                    enter("REWIND", "sound")
                 elif pos is not None and pos >= character.out_end:
                     # Straight into the loop — same file, so nothing loads.
                     mpv.ab_loop(character.loop_a, character.loop_b)
                     enter("LOOP")
+                elif pos is None and now - state_entered > 5.0:
+                    # mpv never reported a position for the clip we asked for.
+                    # Without this, OUT had no way out but a sound.
+                    go_base("mpv never reported a position")
 
             # ----- 1R rewind: always plays out; sound is ignored -----
             elif state == "REWIND":
                 if mpv.finished() or now - state_entered > 20:
-                    go_base()
+                    go_base("rewound")
 
             # ----- 2 loop: the common case. Sound -> 3 -----
             elif state == "LOOP":
@@ -581,10 +893,10 @@ def main():
                     mpv.clear_ab_loop()
                     if loop_exit_mode == "cut":
                         mpv.seek(character.loop_end)
-                        enter("IN")
+                        enter("IN", "sound")
                     else:
                         mpv.set_speed(loop_exit_speed)
-                        enter("LOOP_EXIT")
+                        enter("LOOP_EXIT", "sound")
 
             elif state == "LOOP_EXIT":
                 pos, _ = mpv.progress()
@@ -592,12 +904,12 @@ def main():
                     mpv.set_speed(1.0)
                     enter("IN")
                 elif mpv.finished():
-                    go_base()
+                    go_base("clip ended")
 
             # ----- 3 in: runs to the end of the file, at its normal speed -----
             elif state == "IN":
                 if mpv.finished() or now - state_entered > 20:
-                    go_base()
+                    go_base("back in the wall")
 
             # ----- 4 easter egg: 0 - 4 - 0, deaf to the room -----
             elif state == "EASTER":
@@ -605,7 +917,7 @@ def main():
                     mpv.play(base, loop=True)
                     last_sound = now              # start the wait from here
                     next_quiet = eggs.post_quiet  # a shorter wait after a dog
-                    enter("BASE")
+                    enter("BASE", "dog gone")
 
             # ----- back to the wall, and nobody may come out yet -----
             elif state == "COOLDOWN":
@@ -623,12 +935,37 @@ def main():
                 elif now - state_entered > 1.0:
                     pending_seek[0] = None
 
+            # mpv wedged: alive, but its position hasn't moved. Every clip is
+            # either looping or left within seconds, so a frozen position means
+            # it has stopped listening (TROUBLESHOOTING #5, #10) — and the
+            # screen would hold one frame forever. Kill it; the check at the
+            # top of the loop relaunches it.
+            pos_now = mpv.info()["pos"]
+            if pos_now != seen_pos:
+                seen_pos, pos_moved = pos_now, now
+            elif now - pos_moved > MPV_FROZEN_SECONDS:
+                log_event(f"mpv frozen for {now - pos_moved:.0f}s in {state} — killing it")
+                try:
+                    mpv.proc.kill()
+                except Exception:
+                    pass
+                seen_pos, pos_moved = None, now
+
+            STATUS[0] = {
+                "state": state, "character": character.name,
+                "state_entered": state_entered, "in_state": now - state_entered,
+                "quiet_for": quiet_for, "needs_quiet": next_quiet,
+                "eggs_in": eggs.countdown, "loud": loud, "threshold": threshold,
+            }
+
             if now - last_log > 0.5:
                 level, mic_status = mic.snapshot()
+                age = now - mic.last_sample if mic.last_sample else -1
                 try:
                     with open(LOGFILE, "w") as f:
                         f.write(
-                            f"vol={level:.4f} thr={threshold:.4f} mic={mic_status}\n"
+                            f"vol={level:.4f} thr={threshold:.4f} mic={mic_status} "
+                            f"mic_age={age:.1f}s\n"
                             f"state={state} character={character.name} "
                             f"eggs_in={eggs.countdown}\n"
                             f"quiet={quiet_for:.0f}s / needs {next_quiet:.0f}s "

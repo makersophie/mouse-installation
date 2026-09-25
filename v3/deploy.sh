@@ -20,7 +20,7 @@ echo "Sending to $TARGET:$DEST"
 ssh "$TARGET" "mkdir -p '$DEST'"
 
 rsync -avh --progress \
-  mouse_video.py build_scenes.py mic_check.py diagnose_loop.py watchdog.py scenes.json start_mouse.sh requirements.txt \
+  mouse_video.py monitor.html build_scenes.py mic_check.py diagnose_loop.py watchdog.py scenes.json start_mouse.sh requirements.txt \
   "$TARGET:$DEST/"
 
 if [ "$PHOTOS" = "1" ]; then
