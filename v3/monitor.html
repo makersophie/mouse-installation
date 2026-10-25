@@ -83,6 +83,7 @@
   button { font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 6px; border: 1px solid var(--line);
     background: var(--card); color: var(--ink); cursor: pointer; }
 
+  main.stale .tiles, main.stale section.card { opacity: .45; }
   @media (max-width: 900px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } .two { grid-template-columns: 1fr; } }
   @media (max-width: 460px) { .tiles { grid-template-columns: 1fr; } .big { font-size: 20px; } }
 </style>
@@ -287,7 +288,7 @@ function rate() {
 
 function render() {
   const conn = $('conn');
-  const live = S.offline < 4 && S.last;
+  const live = !!(S.offline < 4 && S.last);
   conn.className = 'pill ' + (live ? 'ok' : 'bad');
   conn.lastChild.textContent = live ? 'live' : 'offline';
 
@@ -297,6 +298,8 @@ function render() {
   const sm = document.createElement('small'); sm.textContent = detail; dg.appendChild(sm);
 
   const d = S.last; if (!d) return;
+  // offline: everything below is the last thing heard, not the present
+  document.querySelector('main').classList.toggle('stale', !live);
   const m = d.mic, st = d.state, now = d.now;
   $('meta').textContent = `pid ${d.pid} · up ${dur(now - d.started)} · Pi clock ${clock(now)}`;
 
@@ -329,7 +332,7 @@ function render() {
   $('trigCount').textContent = `${S.trigTotal} while this page was open`;
 
   // mpv
-  const frozen = (Date.now() - S.posChanged) / 1000 > 5 && !d.mpv.paused;
+  const frozen = live && (Date.now() - S.posChanged) / 1000 > 5 && !d.mpv.paused;
   $('mpvState').textContent = !d.mpv.alive ? 'not running' : frozen ? 'frozen' : d.mpv.paused ? 'paused' : 'playing';
   $('mpvState').className = 'big ' + (!d.mpv.alive || frozen ? 'bad-t' : 'ok-t');
   $('mpvPath').textContent = d.mpv.path || '(loading)';
